@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,7 +14,7 @@ import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, Field
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 # ==========================================
@@ -29,15 +30,20 @@ logger = logging.getLogger("yt_downloader_api")
 DOWNLOAD_DIR = Path("/tmp/ytdlp_downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# Environment Variables for Geo-Bypass
+# Set these in your Vercel/Server Dashboard
+PROXY_URL = os.getenv("PROXY_URL") # Example: http://user:pass@host:port
+YT_COOKIES_BASE64 = os.getenv("YT_COOKIES_BASE64") # Base64 encoded cookies.txt content
+
 # Simple In-Memory Rate Limiter
-RATE_LIMIT = 30  # Requests
-RATE_LIMIT_WINDOW = 60  # Seconds
 request_history: Dict[str, List[float]] = {}
+RATE_LIMIT = 50 
+RATE_LIMIT_WINDOW = 60 
 
 app = FastAPI(
     title="Elite YouTube Downloader API",
-    description="High-performance YouTube downloader API using yt-dlp",
-    version="1.0.0",
+    description="High-performance YouTube downloader API with Geo-Bypass support",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -91,16 +97,15 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
 
 def is_valid_youtube_url(url: str) -> bool:
-    pattern = r"^(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)/.+$"
+    pattern = r"^(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com|youtube\.com/shorts/)/.+$"
     return bool(re.match(pattern, url))
 
 async def cleanup_file(file_path: str, delay: int = 600):
-    """Wait and remove the file from the server."""
     await asyncio.sleep(delay)
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
-            logger.info(f"Cleaned up file: {file_path}")
+            logger.info(f"Cleaned up: {file_path}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
@@ -108,41 +113,46 @@ async def cleanup_file(file_path: str, delay: int = 600):
 async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host
     now = time.time()
-    
-    if client_ip not in request_history:
-        request_history[client_ip] = []
-    
-    # Filter out old requests
-    request_history[client_ip] = [t for t in request_history[client_ip] if now - t < RATE_LIMIT_WINDOW]
-    
+    request_history[client_ip] = [t for t in request_history.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW]
     if len(request_history[client_ip]) >= RATE_LIMIT:
-        return JSONResponse(
-            status_code=HTTP_429_TOO_MANY_REQUESTS,
-            content={"error": "Too many requests. Please try again later."}
-        )
-    
+        return JSONResponse(status_code=HTTP_429_TOO_MANY_REQUESTS, content={"error": "Rate limit exceeded"})
     request_history[client_ip].append(now)
     return await call_next(request)
 
 # ==========================================
-# YT-DLP CORE LOGIC
+# YT-DLP CORE LOGIC (ENHANCED)
 # ==========================================
 
 class YTManager:
     @staticmethod
     def get_opts(custom_opts: Dict = None) -> Dict:
+        # 1. Setup Cookie Path if provided via Environment Variable
+        cookie_path = None
+        if YT_COOKIES_BASE64:
+            try:
+                cookie_path = "/tmp/cookies.txt"
+                with open(cookie_path, "wb") as f:
+                    f.write(base64.b64decode(YT_COOKIES_BASE64))
+            except Exception as e:
+                logger.error(f"Failed to decode cookies: {e}")
+
         base_opts = {
             'quiet': True,
             'no_warnings': True,
             'format': 'best',
-            'socket_timeout': 15,
-            'retries': 3,
+            'socket_timeout': 30,
+            'retries': 5,
             'nocheckcertificate': True,
-            # 'proxy': os.getenv('PROXY_URL'), # Uncomment to use proxy
+            'geo_bypass': True,
+            'geo_bypass_country': 'US', # Force bypass from US region
+            'extract_flat': False,
+            'proxy': PROXY_URL, 
+            'cookiefile': cookie_path,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://www.google.com/',
             }
         }
         if custom_opts:
@@ -150,68 +160,11 @@ class YTManager:
         return base_opts
 
     @classmethod
-    async def get_info(cls, url: str) -> Dict[str, Any]:
-        def extract():
-            with yt_dlp.YoutubeDL(cls.get_opts()) as ydl:
-                return ydl.extract_info(url, download=False)
-        
-        return await asyncio.to_thread(extract)
-
-    @classmethod
-    async def download_video(cls, url: str, format_id: str) -> Dict[str, Any]:
-        unique_id = str(uuid.uuid4())
-        output_tmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
-        
-        opts = cls.get_opts({
-            'format': format_id,
-            'outtmpl': output_tmpl,
-            'merge_output_format': 'mp4',
-        })
-
-        def download():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=True)
-
-        info = await asyncio.to_thread(download)
-        # Handle cases where extension might change (e.g. mkv to mp4)
-        ext = info.get('ext', 'mp4')
-        actual_filename = f"{unique_id}.{ext}"
-        filepath = DOWNLOAD_DIR / actual_filename
-        
-        return {
-            "path": str(filepath),
-            "filename": f"{sanitize_filename(info['title'])}.{ext}",
-            "info": info
-        }
-
-    @classmethod
-    async def download_audio(cls, url: str, ext: str) -> Dict[str, Any]:
-        unique_id = str(uuid.uuid4())
-        output_tmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
-        
-        opts = cls.get_opts({
-            'format': 'bestaudio/best',
-            'outtmpl': output_tmpl,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': ext,
-                'preferredquality': '192',
-            }],
-        })
-
-        def download():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=True)
-
-        info = await asyncio.to_thread(download)
-        actual_filename = f"{unique_id}.{ext}"
-        filepath = DOWNLOAD_DIR / actual_filename
-        
-        return {
-            "path": str(filepath),
-            "filename": f"{sanitize_filename(info['title'])}.{ext}",
-            "info": info
-        }
+    async def extract(cls, url: str, download: bool = False, custom_opts: Dict = None):
+        def _run():
+            with yt_dlp.YoutubeDL(cls.get_opts(custom_opts)) as ydl:
+                return ydl.extract_info(url, download=download)
+        return await asyncio.to_thread(_run)
 
 # ==========================================
 # ENDPOINTS
@@ -219,24 +172,18 @@ class YTManager:
 
 @app.get("/")
 async def root():
-    return {
-        "name": "Elite YouTube Downloader API",
-        "docs": "/docs",
-        "health": "/health",
-        "status": "online"
-    }
+    return {"status": "online", "geo_bypass": "enabled", "proxy_status": "configured" if PROXY_URL else "none"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/info", response_model=VideoInfoResponse)
-async def get_info(url: str = Query(..., description="YouTube URL")):
+async def get_info(url: str = Query(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
-    
     try:
-        info = await YTManager.get_info(url)
+        info = await YTManager.extract(url, download=False)
         return VideoInfoResponse(
             title=info.get("title", "N/A"),
             description=info.get("description", ""),
@@ -253,7 +200,7 @@ async def get_info(url: str = Query(..., description="YouTube URL")):
                 "vcodec": f.get("vcodec"),
                 "acodec": f.get("acodec")
             } for f in info.get("formats", [])],
-            filesize=info.get("filesize"),
+            filesize=info.get("filesize_approx") or info.get("filesize"),
             fps=info.get("fps"),
             resolution=f"{info.get('width')}x{info.get('height')}" if info.get('width') else None,
             codec=info.get("vcodec"),
@@ -268,53 +215,66 @@ async def get_info(url: str = Query(..., description="YouTube URL")):
             chapters=info.get("chapters", [])
         )
     except Exception as e:
-        logger.error(f"Error fetching info: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/formats")
 async def get_formats(url: str = Query(...)):
     try:
-        info = await YTManager.get_info(url)
+        info = await YTManager.extract(url)
         return {"formats": info.get("formats", [])}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/download")
 async def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
-    if not is_valid_youtube_url(req.url):
-        raise HTTPException(status_code=400, detail="Invalid URL")
-    
     try:
-        result = await YTManager.download_video(req.url, req.format_id)
-        background_tasks.add_task(cleanup_file, result["path"])
+        unique_id = str(uuid.uuid4())
+        output_tmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
+        
+        info = await YTManager.extract(req.url, download=True, custom_opts={
+            'format': req.format_id,
+            'outtmpl': output_tmpl,
+            'merge_output_format': 'mp4',
+        })
+        
+        ext = info.get('ext', 'mp4')
+        actual_path = DOWNLOAD_DIR / f"{unique_id}.{ext}"
+        background_tasks.add_task(cleanup_file, str(actual_path))
         
         return {
             "success": True,
-            "filename": result["filename"],
-            "mime": "video/mp4",
-            "download_url": f"/stream/{os.path.basename(result['path'])}?name={result['filename']}",
-            "size": result["info"].get("filesize"),
-            "duration": result["info"].get("duration")
+            "filename": f"{sanitize_filename(info['title'])}.{ext}",
+            "download_url": f"/stream/{unique_id}.{ext}?name={sanitize_filename(info['title'])}.{ext}",
+            "size": info.get("filesize_approx") or info.get("filesize"),
+            "duration": info.get("duration")
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/audio")
 async def download_audio(req: AudioRequest, background_tasks: BackgroundTasks):
-    if not is_valid_youtube_url(req.url):
-        raise HTTPException(status_code=400, detail="Invalid URL")
-    
     try:
-        result = await YTManager.download_audio(req.url, req.ext)
-        background_tasks.add_task(cleanup_file, result["path"])
+        unique_id = str(uuid.uuid4())
+        output_tmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
+        
+        info = await YTManager.extract(req.url, download=True, custom_opts={
+            'format': 'bestaudio/best',
+            'outtmpl': output_tmpl,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': req.ext,
+                'preferredquality': '192',
+            }],
+        })
+        
+        actual_path = DOWNLOAD_DIR / f"{unique_id}.{req.ext}"
+        background_tasks.add_task(cleanup_file, str(actual_path))
         
         return {
             "success": True,
-            "filename": result["filename"],
-            "mime": f"audio/{req.ext}",
-            "download_url": f"/stream/{os.path.basename(result['path'])}?name={result['filename']}",
-            "size": result["info"].get("filesize"),
-            "duration": result["info"].get("duration")
+            "filename": f"{sanitize_filename(info['title'])}.{req.ext}",
+            "download_url": f"/stream/{unique_id}.{req.ext}?name={sanitize_filename(info['title'])}.{req.ext}",
+            "duration": info.get("duration")
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -322,45 +282,18 @@ async def download_audio(req: AudioRequest, background_tasks: BackgroundTasks):
 @app.get("/thumbnail")
 async def get_thumbnail(url: str = Query(...)):
     try:
-        info = await YTManager.get_info(url)
-        thumb = info.get("thumbnail")
-        if thumb:
-            return RedirectResponse(thumb)
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.get("/captions")
-async def get_captions(url: str = Query(...)):
-    try:
-        info = await YTManager.get_info(url)
-        return {
-            "subtitles": info.get("subtitles", {}),
-            "automatic_captions": info.get("automatic_captions", {})
-        }
+        info = await YTManager.extract(url)
+        return RedirectResponse(info.get("thumbnail"))
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/playlist")
 async def get_playlist(url: str = Query(...)):
     try:
-        info = await YTManager.get_info(url)
-        if "entries" not in info:
-            raise HTTPException(status_code=400, detail="Not a playlist")
-            
-        entries = []
-        for entry in info["entries"]:
-            if entry:
-                entries.append({
-                    "id": entry.get("id"),
-                    "title": entry.get("title"),
-                    "url": f"https://www.youtube.com/watch?v={entry.get('id')}",
-                    "duration": entry.get("duration")
-                })
+        info = await YTManager.extract(url, custom_opts={'extract_flat': True})
         return {
-            "playlist_title": info.get("title"),
-            "video_count": len(entries),
-            "videos": entries
+            "title": info.get("title"),
+            "videos": [{"id": e.get("id"), "title": e.get("title"), "url": e.get("url")} for e in info.get("entries", [])]
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -368,41 +301,17 @@ async def get_playlist(url: str = Query(...)):
 @app.get("/search")
 async def search(q: str = Query(...)):
     try:
-        opts = YTManager.get_opts({"extract_flat": True})
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, f"ytsearch5:{q}", download=False)
-            return {"results": info.get("entries", [])}
+        info = await YTManager.extract(f"ytsearch5:{q}", custom_opts={'extract_flat': True})
+        return {"results": info.get("entries", [])}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/stream/{file_id}")
 async def stream_file(file_id: str, name: str = "download"):
-    """Helper endpoint to serve the actual file."""
     file_path = DOWNLOAD_DIR / file_id
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File expired or not found")
-    
-    # Simple path traversal protection
-    if ".." in file_id or "/" in file_id:
-        raise HTTPException(status_code=400, detail="Invalid file ID")
-
-    return FileResponse(
-        path=file_path,
-        filename=name,
-        media_type="application/octet-stream"
-    )
-
-# ==========================================
-# ERROR HANDLERS
-# ==========================================
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Global Error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal Server Error", "message": str(exc)},
-    )
+    if not file_path.exists() or ".." in file_id:
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path=file_path, filename=name)
 
 if __name__ == "__main__":
     import uvicorn
