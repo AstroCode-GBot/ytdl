@@ -9,47 +9,31 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import aiofiles
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 # ==========================================
-# CONFIGURATION & LOGGING
+# CONFIGURATION
 # ==========================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("yt_downloader_api")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ELITE_YTDL_API")
 
 DOWNLOAD_DIR = Path("/tmp/ytdlp_downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Environment Variables for Geo-Bypass
-# Set these in your Vercel/Server Dashboard
-PROXY_URL = os.getenv("PROXY_URL") # Example: http://user:pass@host:port
-YT_COOKIES_BASE64 = os.getenv("YT_COOKIES_BASE64") # Base64 encoded cookies.txt content
+# YOUR PROVIDED DATA
+USER_PROXY = "http://cejpdwtu:c9pexrhy2ymk@31.59.20.176:6754"
+USER_COOKIES_B64 = "IyBOZXRzY2FwZSBIVFRQIENvb2tpZSBGaWxlCiMgaHR0cHM6Ly9jdXJsLmhheHguc2UvcmZjL2Nvb2tpZV9zcGVjLmh0bWwKIyBUaGlzIGlzIGEgZ2VuZXJhdGVkIGZpbGUhIERvIG5vdCBlZGl0LgoKLnlvdXR1YmUuY29tCVRSVUUJLwlGQUxTRQkxODE5NDc0MDMwCUhTSUQJQVlGcHJKejZGcjhlWTE2aEEKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTk0NzQwMzAJU1NJRAlBa2FDMmkzNXZMcDM2R1k5egoueW91dHViZS5jb20JVFJVRQkvCUZBTFNFCTE4MTk0NzQwMzAJQVBJU0lECXFwUzUxRzhSX19ZWk1FRHkvQWx4YkVJcUdwTkJpWUM4NmcKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTk0NzQwMzAJU0FQSVNJRAloREdEa09ScmpFVl8xX3F1L0FnU044QnJBWmRDMk9ySHU5Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE5NDc0MDMwCV9fU2VjdXJlLTFQQVBJU0lECWhER0RrT1JyakVWXzFfcXUvQWdTTjhCckFaZEMyT3JIdTkKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTk0NzQwMzAJX19TZWN1cmUtM1BBUElTSUQJaERHRGtPUnJqRVZfMV9xdS9BZ1NOOEJyQVpkQzJPckh1OQoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgxOTQ3NDI4MQlQUkVGCWY2PTQwMDAwMDAwJnR6PUFzaWEuRGhha2EmZjc9MTAwCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE2NDQ5OTg1CV9fU2VjdXJlLTFQU0lEVFMJc2lkdHMtQ2pRQlBXRXUyWEFBTkFEaEZwM3k3X28zaHpoUmFaRTBCSkI3UWpUZFBfYm5JRFFTMUZBVHNBMUhFUngwX3Z6UmhYUDdLdmJ4RUFBCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE2NDQ5OTg1CV9fU2VjdXJlLTNQU0lEVFMJc2lkdHMtQ2pRQlBXRXUyWEFBTkFEaEZwM3k3X28zaHpoUmFaRTBCSkI3UWpUZFBfYm5JRFFTMUZBVHNBMUhFUngwX3Z6UmhYUDdLdmJ4RUFBCi55b3V0dWJlLmNvbQlUUlVFCS8JRkFMU0UJMTgxOTQ3NDAzMAlTSUQJZy5hMDAwQXdtUlRKNERfSmJGTzBLbE9sY2FvVWtON0g0dnV1NnFlWTQ2ZGZLNkl5R1plVkliNGpNbGw1M1hCYXpZWVBRd0Q1VkJUQUFDZ1lLQVM0U0FSWVNGUUhHWDJNaW9yN1BOUEdTTkJjNWNZX1gyV0ZNYWhvVkFVRjh5S3BRaTltNlRYOEVjdEFCZUx4S2ZULWgwMDc2Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE5NDc0MDMwCV9fU2VjdXJlLTFQU0lECWcuYTAwMEF3bVJUSjREX0piRk8wS2xPbGNhb1VrTjdINHZ1dTZxZVk0NmRmSzZJeUdaZVZJYjN4WkRfbnRzbWdwbzZkcXF2R0wyYXdBQ2dZS0FUWVNBUllTRlFIR1gyTWk0SkJLNFZ2ckVweTBuS3drUHRFdGF4b1ZBVUY4eUtyTE9Cb1h5ZXpFUWRDS19OUGozZjN1MDA3NgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgxOTQ3NDAzMAlfX1NlY3VyZS0zUFNJRAlnLmEwMDBBd21SVEo0RF9KYkZPMEtsT2xjYW9Va043SDR2dXU2cWVZNDZkZks2SXlHWmVWSWJRRnRrYWlZUW5EbjE0blV1UXFSQUFRQUNnWUtBUW9TQVJZU0ZRSEdYMk1pMFpJamNjZnVHeUFOaktwR0dEN2hhaG9WQVVGOHlLcURPNnJwblNQd0dqOW1PVGQtUXVuQzAwNzYKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTk0NzQyNzcJTE9HSU5fSU5GTwlBRm1tRjJzd1JBSWdUVDRENU1HNGp5QmtKbTR3VEcteW9nV0dZVVd4aGlIcW0yVHdPSFhoS3JrQ0lFWXJxeEFDMzB4bldvbXJxRVZUcHdVdEZKOEY1YXQxNDJqcXB3RFdVaVRXOlFVUTNNak5tZW5sNU0xVmxWRTF2WDFwVFpTMDNjVXBQUlRSUWMwRnVhMkp4Y0RoTGEwVTVPVnBrZVRWV2FuTjZVMnhIVW1oWU9GcHphbGx4TTNKR2NrRjFUMVJvTjJoUllreDBTVjlGVVVOWFRYTnJjRFkyY2tGSVREQmZSa1JRZUdveFdHVkpOMFZRYjBsYU5uTXllbEpWWjE4eVNUZFdXbDlvUzA1QmRtTnVSSFp2Vm5wcFJucHZkSGhhUjE5MVRXZFNkVUV0YjFnMGEzVkNOM3BOVkhoUgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTc4NDkxNDg4MQlDT05TSVNURU5DWQlBRmVoZVcwd3phZEczS29PN0dDeWlUQXdjMUYwMVNsc3Ezdk5rXy1Ja2tvaVFVRXlCMU5VdjMyTUxEcXNTc042cGpaZjYzd1Y4YU5zVUFrZ0VFdjVUOE9welFpREh0OHpsSTc5T1dHRW1sWlJqcVlhOFF1SVRVc0h2cmFoeVQ1OGxJT2lheEQ2UkFfZ1BNMl9iS05KVnljZwoueW91dHViZS5jb20JVFJVRQkvCUZBTFNFCTE4MTY0NTAyODcJU0lEQ0MJQUtFeVh6V01KLVJObng5NThkVEF6YklRc2poZUk2NkRjaU53ZU5EQWdVb0ZBM3ZKWHJRUFZZZDhmVW5rU2FQd1dMa19jUy1KNW1FCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE2NDUwMjg3CV9fU2VjdXJlLTFQU0lEQ0MJQUtFeVh6WC02ZGlQUGFsNFdoaTM1dV9HWE9qcGtzUGdKSDMxcDFLb0NQSFRHRHFXZC1YR0ZDRUFhQ3hJVzJ3Ui1XZ0NaNU9kc3cKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTY0NTAyODcJX19TZWN1cmUtM1BTSURDQwlBS0V5WHpWa2EtMF9xLTQ5MmtXck1KVHZtOWtPa0FacWM1c3ZJd29UN0R1SzZkdFNiazJKNFVBR0pFbFBTM3l2MEVEQjU5Z2t1UQoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgwMDQ2NjI4NwlWSVNJVE9SX0lORk8xX0xJVkUJZHpDS0gxeGlIUWcKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDA0NjYyODcJVklTSVRPUl9QUklWQUNZX01FVEFEQVRBCUNnSkNSQklFR2dBZ1NBJTNEJTNECi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODAwNDMyOTM5CV9fU2VjdXJlLVlOSUQJMjAuWVQ9VHA1ZERISkJKV3JIWF9DY0xPT2ZMdHBVdjNoU0dzNzNWSXhMLTFvdERVc2h6bDcxWlF6S2I1VzVCWDJKUllmdXZkRi1peGNvaUVyel9VaFB0cFNXS0s4aUw2dlhuU3Z2eDNabFRQaFBNc3YtRlZHX202dXlmenR4OWRseGtnb190ak5uckF1SXVVUXlQcDBlVVk0MXpqSmVfZWhqeEhjOFc1b2w1amdmY2NUWlhCSEJ3bnNvNWl1Q1BoZEszaW9yMEVRZzlCdkZlOEtqcURfYkF1eDZJQXNvUDd0VG5tN1VDUkxxdDVCZFZBUWxCQkFaUHAzeVV2WmhuSm5uN0ZHdU1zUFpmMmVUQmlnNHhjbDNvR2ZGa1JMNnNiWjBDSmpBdllYYVFRWXJOWVVRWnZINmUwYzRzeENRN3ZOamV1TV81WWxFelY2aUNqMnBNaDZWLUNQSUpRCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODAwNDMyOTM5CV9fU2VjdXJlLVJPTExPVVRfVE9LRU4JQ095M3VabnUyT0RkZ1FFUTFiNlA0NmpWbFFNWXlfUzIwdV9xbFFNJTNECi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkwCVlTQwlzc3R0Q3B4cjc3OAo="
 
-# Simple In-Memory Rate Limiter
-request_history: Dict[str, List[float]] = {}
-RATE_LIMIT = 50 
-RATE_LIMIT_WINDOW = 60 
-
-app = FastAPI(
-    title="Elite YouTube Downloader API",
-    description="High-performance YouTube downloader API with Geo-Bypass support",
-    version="1.1.0",
-)
+app = FastAPI(title="Pro YT Downloader API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -59,112 +43,52 @@ app.add_middleware(
 # ==========================================
 
 class DownloadRequest(BaseModel):
-    url: str = Field(..., description="The YouTube URL")
-    format_id: Optional[str] = Field("bestvideo+bestaudio/best", description="yt-dlp format selection")
+    url: str
+    format_id: Optional[str] = "bestvideo+bestaudio/best"
 
 class AudioRequest(BaseModel):
-    url: str = Field(..., description="The YouTube URL")
-    ext: str = Field("mp3", pattern="^(mp3|m4a|aac|wav|opus|flac)$")
-
-class VideoInfoResponse(BaseModel):
-    title: str
-    description: Optional[str]
-    duration: Optional[int]
-    views: Optional[int]
-    channel: Optional[str]
-    upload_date: Optional[str]
-    thumbnail: Optional[str]
-    formats: List[Dict[str, Any]]
-    filesize: Optional[int]
-    fps: Optional[int]
-    resolution: Optional[str]
-    codec: Optional[str]
-    bitrate: Optional[float]
-    language: Optional[str]
-    tags: List[str]
-    categories: List[str]
-    is_live: bool
-    was_live: bool
-    availability: Optional[str]
-    age_limit: int
-    chapters: List[Dict[str, Any]]
+    url: str
+    ext: str = "mp3"
 
 # ==========================================
-# UTILS & MIDDLEWARE
+# CORE LOGIC
 # ==========================================
 
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
-
-def is_valid_youtube_url(url: str) -> bool:
-    pattern = r"^(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com|youtube\.com/shorts/)/.+$"
-    return bool(re.match(pattern, url))
-
-async def cleanup_file(file_path: str, delay: int = 600):
-    await asyncio.sleep(delay)
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up: {file_path}")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    client_ip = request.client.host
-    now = time.time()
-    request_history[client_ip] = [t for t in request_history.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW]
-    if len(request_history[client_ip]) >= RATE_LIMIT:
-        return JSONResponse(status_code=HTTP_429_TOO_MANY_REQUESTS, content={"error": "Rate limit exceeded"})
-    request_history[client_ip].append(now)
-    return await call_next(request)
-
-# ==========================================
-# YT-DLP CORE LOGIC (ENHANCED)
-# ==========================================
+def get_cookie_file():
+    cookie_path = "/tmp/youtube_cookies.txt"
+    with open(cookie_path, "wb") as f:
+        f.write(base64.b64decode(USER_COOKIES_B64))
+    return cookie_path
 
 class YTManager:
     @staticmethod
-    def get_opts(custom_opts: Dict = None) -> Dict:
-        # 1. Setup Cookie Path if provided via Environment Variable
-        cookie_path = None
-        if YT_COOKIES_BASE64:
-            try:
-                cookie_path = "/tmp/cookies.txt"
-                with open(cookie_path, "wb") as f:
-                    f.write(base64.b64decode(YT_COOKIES_BASE64))
-            except Exception as e:
-                logger.error(f"Failed to decode cookies: {e}")
-
-        base_opts = {
+    def get_ydl_opts(extra_opts: Dict = None) -> Dict:
+        opts = {
             'quiet': True,
             'no_warnings': True,
-            'format': 'best',
-            'socket_timeout': 30,
-            'retries': 5,
             'nocheckcertificate': True,
             'geo_bypass': True,
-            'geo_bypass_country': 'US', # Force bypass from US region
-            'extract_flat': False,
-            'proxy': PROXY_URL, 
-            'cookiefile': cookie_path,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://www.google.com/',
-            }
+            'proxy': USER_PROXY,
+            'cookiefile': get_cookie_file(),
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'socket_timeout': 30,
+            'retries': 5,
         }
-        if custom_opts:
-            base_opts.update(custom_opts)
-        return base_opts
+        if extra_opts:
+            opts.update(extra_opts)
+        return opts
 
     @classmethod
-    async def extract(cls, url: str, download: bool = False, custom_opts: Dict = None):
-        def _run():
-            with yt_dlp.YoutubeDL(cls.get_opts(custom_opts)) as ydl:
+    async def run_async(cls, url: str, download: bool = False, extra_opts: Dict = None):
+        def _exec():
+            with yt_dlp.YoutubeDL(cls.get_ydl_opts(extra_opts)) as ydl:
                 return ydl.extract_info(url, download=download)
-        return await asyncio.to_thread(_run)
+        return await asyncio.to_thread(_exec)
+
+async def auto_delete(file_path: str):
+    await asyncio.sleep(600) # Delete after 10 mins
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 # ==========================================
 # ENDPOINTS
@@ -172,94 +96,76 @@ class YTManager:
 
 @app.get("/")
 async def root():
-    return {"status": "online", "geo_bypass": "enabled", "proxy_status": "configured" if PROXY_URL else "none"}
+    return {"status": "online", "proxy": "active", "cookies": "loaded"}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy"}
 
-@app.get("/info", response_model=VideoInfoResponse)
-async def get_info(url: str = Query(...)):
-    if not is_valid_youtube_url(url):
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+@app.get("/api")
+async def api_info_downloader(url: str = Query(..., alias="url")):
+    """Custom endpoint requested: /api?url=yturl"""
     try:
-        info = await YTManager.extract(url, download=False)
-        return VideoInfoResponse(
-            title=info.get("title", "N/A"),
-            description=info.get("description", ""),
-            duration=info.get("duration"),
-            views=info.get("view_count"),
-            channel=info.get("uploader"),
-            upload_date=info.get("upload_date"),
-            thumbnail=info.get("thumbnail"),
-            formats=[{
-                "format_id": f.get("format_id"),
-                "extension": f.get("ext"),
-                "resolution": f.get("resolution"),
-                "filesize": f.get("filesize"),
-                "vcodec": f.get("vcodec"),
-                "acodec": f.get("acodec")
-            } for f in info.get("formats", [])],
-            filesize=info.get("filesize_approx") or info.get("filesize"),
-            fps=info.get("fps"),
-            resolution=f"{info.get('width')}x{info.get('height')}" if info.get('width') else None,
-            codec=info.get("vcodec"),
-            bitrate=info.get("tbr"),
-            language=info.get("language"),
-            tags=info.get("tags", []),
-            categories=info.get("categories", []),
-            is_live=info.get("is_live", False),
-            was_live=info.get("was_live", False),
-            availability=info.get("availability"),
-            age_limit=info.get("age_limit", 0),
-            chapters=info.get("chapters", [])
-        )
+        info = await YTManager.run_async(url, download=False)
+        return {
+            "title": info.get("title"),
+            "id": info.get("id"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "uploader": info.get("uploader"),
+            "views": info.get("view_count"),
+            "formats": [
+                {"id": f["format_id"], "ext": f["ext"], "res": f.get("resolution"), "note": f.get("format_note")}
+                for f in info.get("formats", []) if f.get("vcodec") != "none"
+            ]
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/info")
+async def get_info(url: str):
+    return await api_info_downloader(url)
 
 @app.get("/formats")
-async def get_formats(url: str = Query(...)):
-    try:
-        info = await YTManager.extract(url)
-        return {"formats": info.get("formats", [])}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+async def get_formats(url: str):
+    info = await YTManager.run_async(url)
+    return {"formats": info.get("formats")}
 
 @app.post("/download")
-async def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
+async def post_download(req: DownloadRequest, tasks: BackgroundTasks):
     try:
-        unique_id = str(uuid.uuid4())
-        output_tmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
+        uid = str(uuid.uuid4())
+        path_tmpl = str(DOWNLOAD_DIR / f"{uid}.%(ext)s")
         
-        info = await YTManager.extract(req.url, download=True, custom_opts={
+        info = await YTManager.run_async(req.url, download=True, extra_opts={
             'format': req.format_id,
-            'outtmpl': output_tmpl,
-            'merge_output_format': 'mp4',
+            'outtmpl': path_tmpl,
+            'merge_output_format': 'mp4'
         })
         
         ext = info.get('ext', 'mp4')
-        actual_path = DOWNLOAD_DIR / f"{unique_id}.{ext}"
-        background_tasks.add_task(cleanup_file, str(actual_path))
+        final_file = DOWNLOAD_DIR / f"{uid}.{ext}"
+        tasks.add_task(auto_delete, str(final_file))
         
+        safe_name = re.sub(r'[^\w\-.]', '_', info['title'])
         return {
             "success": True,
-            "filename": f"{sanitize_filename(info['title'])}.{ext}",
-            "download_url": f"/stream/{unique_id}.{ext}?name={sanitize_filename(info['title'])}.{ext}",
-            "size": info.get("filesize_approx") or info.get("filesize"),
-            "duration": info.get("duration")
+            "filename": f"{safe_name}.{ext}",
+            "download_url": f"/stream/{uid}.{ext}?name={safe_name}.{ext}",
+            "size": info.get("filesize")
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/audio")
-async def download_audio(req: AudioRequest, background_tasks: BackgroundTasks):
+async def post_audio(req: AudioRequest, tasks: BackgroundTasks):
     try:
-        unique_id = str(uuid.uuid4())
-        output_tmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
+        uid = str(uuid.uuid4())
+        path_tmpl = str(DOWNLOAD_DIR / f"{uid}.%(ext)s")
         
-        info = await YTManager.extract(req.url, download=True, custom_opts={
+        info = await YTManager.run_async(req.url, download=True, extra_opts={
             'format': 'bestaudio/best',
-            'outtmpl': output_tmpl,
+            'outtmpl': path_tmpl,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': req.ext,
@@ -267,51 +173,44 @@ async def download_audio(req: AudioRequest, background_tasks: BackgroundTasks):
             }],
         })
         
-        actual_path = DOWNLOAD_DIR / f"{unique_id}.{req.ext}"
-        background_tasks.add_task(cleanup_file, str(actual_path))
+        final_file = DOWNLOAD_DIR / f"{uid}.{req.ext}"
+        tasks.add_task(auto_delete, str(final_file))
         
+        safe_name = re.sub(r'[^\w\-.]', '_', info['title'])
         return {
             "success": True,
-            "filename": f"{sanitize_filename(info['title'])}.{req.ext}",
-            "download_url": f"/stream/{unique_id}.{req.ext}?name={sanitize_filename(info['title'])}.{req.ext}",
-            "duration": info.get("duration")
+            "filename": f"{safe_name}.{req.ext}",
+            "download_url": f"/stream/{uid}.{req.ext}?name={safe_name}.{req.ext}"
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/thumbnail")
-async def get_thumbnail(url: str = Query(...)):
-    try:
-        info = await YTManager.extract(url)
-        return RedirectResponse(info.get("thumbnail"))
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+async def get_thumb(url: str):
+    info = await YTManager.run_async(url)
+    return RedirectResponse(info.get("thumbnail"))
+
+@app.get("/captions")
+async def get_captions(url: str):
+    info = await YTManager.run_async(url)
+    return {"subtitles": info.get("subtitles"), "auto": info.get("automatic_captions")}
 
 @app.get("/playlist")
-async def get_playlist(url: str = Query(...)):
-    try:
-        info = await YTManager.extract(url, custom_opts={'extract_flat': True})
-        return {
-            "title": info.get("title"),
-            "videos": [{"id": e.get("id"), "title": e.get("title"), "url": e.get("url")} for e in info.get("entries", [])]
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+async def get_playlist(url: str):
+    info = await YTManager.run_async(url, extra_opts={'extract_flat': True})
+    return {"title": info.get("title"), "videos": info.get("entries")}
 
 @app.get("/search")
-async def search(q: str = Query(...)):
-    try:
-        info = await YTManager.extract(f"ytsearch5:{q}", custom_opts={'extract_flat': True})
-        return {"results": info.get("entries", [])}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+async def search_yt(q: str):
+    info = await YTManager.run_async(f"ytsearch5:{q}", extra_opts={'extract_flat': True})
+    return {"results": info.get("entries")}
 
 @app.get("/stream/{file_id}")
-async def stream_file(file_id: str, name: str = "download"):
+async def serve_file(file_id: str, name: str = "video.mp4"):
     file_path = DOWNLOAD_DIR / file_id
     if not file_path.exists() or ".." in file_id:
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path=file_path, filename=name)
+        raise HTTPException(status_code=404, detail="File not found or expired")
+    return FileResponse(file_path, filename=name)
 
 if __name__ == "__main__":
     import uvicorn
