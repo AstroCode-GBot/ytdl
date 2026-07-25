@@ -7,7 +7,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "online",
-        "endpoint": "/api?url=https://youtube.com/watch?v=..."
+        "endpoint": "/api?url=https://www.youtube.com/watch?v=VIDEO_ID"
     })
 
 @app.route("/api")
@@ -15,36 +15,49 @@ def api():
     url = request.args.get("url")
 
     if not url:
-        return jsonify({"error": "Missing url"}), 400
+        return jsonify({"success": False, "error": "Missing url parameter"}), 400
 
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "extract_flat": False,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
+        formats = []
+
+        for f in info.get("formats", []):
+            if not f.get("url"):
+                continue
+
+            formats.append({
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "resolution": f"{f.get('width')}x{f.get('height')}" if f.get("height") else None,
+                "fps": f.get("fps"),
+                "filesize": f.get("filesize"),
+                "url": f.get("url")
+            })
+
         return jsonify({
+            "success": True,
             "title": info.get("title"),
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
             "uploader": info.get("uploader"),
-            "formats": [
-                {
-                    "format_id": f.get("format_id"),
-                    "ext": f.get("ext"),
-                    "height": f.get("height"),
-                    "url": f.get("url")
-                }
-                for f in info.get("formats", [])
-                if f.get("url")
-            ]
+            "view_count": info.get("view_count"),
+            "formats": formats
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
-# Vercel looks for `app`
+if __name__ == "__main__":
+    app.run(debug=True)
